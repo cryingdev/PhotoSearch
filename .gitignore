@@ -1,0 +1,6 @@
+models/*
+/PhotoSearch/Core/MobileCLIP/Models
+*.xcbkptlist
+/PhotoSearch/Core/MobileCLIP/Models/mobileclip_s2_text.mlpackage/Data
+*.bin
+*.mlmodel
