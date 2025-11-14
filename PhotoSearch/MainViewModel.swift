@@ -9,105 +9,185 @@ import SwiftUI
 import Combine
 import CoreML
 
+struct SearchResult {
+    let localIdentifier: String
+    let score: Float
+}
+
 @MainActor
 final class MainViewModel: ObservableObject {
 
-    struct SampleItem: Identifiable {
-        let id: String
-        let title: String
-        let imageName: String
-        var embedding: [Float]?
-    }
-
     @Published var query: String = ""
-    @Published var results: [SampleItem] = []
+    @Published var results: [SearchResult] = []
     @Published var isIndexing: Bool = false
     @Published var statusMessage: String?
+    @Published var authState: PhotoAuthorizationState = .notDetermined
 
-    private var items: [SampleItem] = [
-        .init(id: "apple",  title: "Apple",  imageName: "apple",  embedding: nil),
-        .init(id: "banana", title: "Banana", imageName: "banana", embedding: nil),
-        .init(id: "otter",  title: "Otter",  imageName: "otter",  embedding: nil),
-    ]
+    // ✅ 포토 라이브러리에서 가져온 자산 목록 (최신순)
+    @Published var photoAssets: [PhotoAssetInfo] = []
+
+    /// 검색어와 검색 결과에 따라 그리드에 표시할 자산 목록
+    var filteredAssets: [PhotoAssetInfo] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 검색어가 없거나, 아직 결과가 없으면 전체 자산을 그대로 반환
+        guard !trimmed.isEmpty, !results.isEmpty else {
+            return photoAssets
+        }
+
+        // 빠른 조회를 위해 id -> asset 맵 구성
+        let assetById = Dictionary(uniqueKeysWithValues: photoAssets.map { ($0.id, $0) })
+
+        // results(유사도 순 정렬)를 기준으로 자산을 필터링 및 정렬
+        return results.compactMap { assetById[$0.localIdentifier] }
+    }
 
     private let engine: MobileCLIPEngineProtocol
+    private let embeddingRepo: ImageEmbeddingRepository
+    private let authRepo: PhotoAuthorizationRepository
+    private let photoRepo: PhotoLibraryRepository
+    private let modelName = "MobileCLIP-S2"
 
-    init(engine: MobileCLIPEngineProtocol) {
+    init(
+        engine: MobileCLIPEngineProtocol,
+        embeddingRepo: ImageEmbeddingRepository,
+        authRepo: PhotoAuthorizationRepository,
+        photoRepo: PhotoLibraryRepository
+    ) {
         self.engine = engine
+        self.embeddingRepo = embeddingRepo
+        self.authRepo = authRepo
+        self.photoRepo = photoRepo
     }
-
-    // View에서 onAppear에서 호출
+    
     func setupIfNeeded() {
-        guard !isIndexing, results.isEmpty else { return }
         Task {
-            await buildInitialIndex()
+            // 1) 권한 요청
+            let state = await authRepo.requestAuthorizationIfNeeded()
+            authState = state
+            
+            switch state {
+            case .authorized:
+                // 2) 권한 OK → 인덱싱 진행
+                await loadPhotoAssets()     // ✅ 포토 라이브러리 자산 로드
+                await buildInitialIndex()   // 엔진 로드
+            case .denied:
+                statusMessage = "사진 접근 권한이 필요합니다. 설정에서 허용해 주세요."
+            case .notDetermined:
+                statusMessage = "사진 권한 상태를 확인 중입니다."
+            }
         }
     }
+    
+    private func loadPhotoAssets() async {
+        let assets = await photoRepo.fetchAllAssets()
+        // PhotoLibraryRepository에서 이미 최신순으로 정렬했으므로 그대로 사용
+        self.photoAssets = assets
+    }
+    
+    // MARK: - Thumbnail helper
+    func loadThumbnail(for id: String, targetSize: CGSize) async -> UIImage? {
+        await photoRepo.requestImage(for: id, targetSize: targetSize)
+    }
 
+    // MARK: - 엔진 로드(추후 UseCase로 분리할 예정)
     private func buildInitialIndex() async {
         isIndexing = true
         statusMessage = "Loading model..."
         await engine.load()
 
-        statusMessage = "Indexing sample images..."
-        var newItems: [SampleItem] = []
-
-        for var item in items {
-            guard let uiImage = UIImage(named: item.imageName) else {
-                print("⚠️ Failed to load image: \(item.imageName)")
-                newItems.append(item)
-                continue
-            }
-            do {
-                let embedding = try await engine.embedImage(uiImage: uiImage)
-                item.embedding = embedding
-            } catch {
-                print("⚠️ Embedding failed for \(item.imageName): \(error)")
-            }
-            newItems.append(item)
-        }
-
-        items = newItems
-        results = newItems        // 초기에는 그냥 전체 노출
+        statusMessage = "Indexing photos..."
+        await indexAssetsIfNeeded()      // ✅ 여기서 실제 인덱싱
+        
         statusMessage = "Ready"
         isIndexing = false
+
+        await loadAllAsResults()
     }
 
+    private func loadAllAsResults() async {
+        let stored = await embeddingRepo.fetchAll(modelName: modelName)
+
+        // 점수는 0으로 두고, 일단 전체 보여주기
+        let mapped = stored.map { item in
+            SearchResult(localIdentifier: item.localIdentifier, score: 0)
+        }
+
+        results = mapped
+    }
+
+    private func indexAssetsIfNeeded() async {
+        // 1) 이미 저장된 임베딩 목록
+        let existing = await embeddingRepo.fetchAll(modelName: modelName)
+        let existingIds = Set(existing.map { $0.localIdentifier })
+
+        // 2) 포토 라이브러리 자산 전체 순회
+        for asset in photoAssets {
+            if existingIds.contains(asset.id) {
+                continue  // 이미 인덱싱된 사진은 스킵
+            }
+
+            // 적당한 해상도로 이미지 요청
+            let base: CGFloat = 256
+            let scale = UIScreen.main.scale
+            let targetSize = CGSize(width: base * scale, height: base * scale)
+
+            guard let uiImage = await loadThumbnail(for: asset.id, targetSize: targetSize) else {
+                continue
+            }
+
+            do {
+                // 3) MobileCLIP으로 이미지 임베딩 계산
+                let vector = try await engine.embedImage(uiImage: uiImage)
+
+                // 4) Repository에 저장
+                let embedding = PhotoEmbedding(
+                    localIdentifier: asset.id,
+                    modelName: modelName,
+                    embedding: vector,
+                    updatedAt: Date()
+                )
+                await embeddingRepo.save(embedding)
+            } catch {
+                print("Indexing failed for \(asset.id): \(error)")
+            }
+        }
+    }
+    
+    // MARK: - 검색
+
     func search() {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            // 쿼리 비어 있으면 전체 보여주기
-            results = items
+        let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            Task { await loadAllAsResults() }
             return
         }
 
         Task {
-            await performSearch(query: trimmed)
+            await performSearch(query: text)
         }
     }
 
     private func performSearch(query: String) async {
         do {
-            let queryEmbedding = try await engine.embedText(query)
+            let queryVector = try await engine.embedText(query)
+            let stored = await embeddingRepo.fetchAll(modelName: modelName)
 
-            // 임베딩 없는 아이템은 제외
-            let validItems = items.compactMap { item -> (SampleItem, Float)? in
-                guard let v = item.embedding else { return nil }
-                let score = EmbeddingUtils.cosineSimilarity(queryEmbedding, v)
-                return (item, score)
+            let scored: [SearchResult] = stored.map { item in
+                let score = EmbeddingUtils.cosineSimilarity(queryVector, item.embedding)
+                return SearchResult(localIdentifier: item.localIdentifier, score: score)
             }
 
-            let sorted = validItems
-                .sorted { $0.1 > $1.1 } // score 내림차순
-                .map { $0.0 }
-
-            await MainActor.run {
-                self.results = sorted
-            }
+            let sorted = scored.sorted { $0.score > $1.score }
+            results = sorted
         } catch {
-            await MainActor.run {
-                self.statusMessage = "Search failed: \(error.localizedDescription)"
-            }
+            statusMessage = "Search failed: \(error.localizedDescription)"
         }
+    }
+    
+    // MARK: - Debug helpers
+
+    /// Return the similarity score for a given asset id, if available.
+    func score(for assetId: String) -> Float? {
+        results.first(where: { $0.localIdentifier == assetId })?.score
     }
 }
