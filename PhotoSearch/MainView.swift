@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import Translation
 
 struct MainView: View {
     
@@ -85,6 +86,21 @@ struct MainView: View {
                     permissionOverlay
                 }
             }
+            // 번역 세션 준비 + 클로저 주입
+            .translationTask(viewModel.translationConfiguration) { session in
+                do {
+                    try await session.prepareTranslation()
+                    viewModel.translatedText = { text in
+                        print(text)
+                        let result = try await session.translate(text)
+                        print(result.targetText)
+                        return result.targetText
+                    }
+                } catch {
+                    // TODO: 필요 시 에러 처리
+                }
+            }
+            .onAppear { viewModel.configureTranslation() }
         }
     }
     

@@ -8,6 +8,7 @@
 import SwiftUI
 import Combine
 import CoreML
+import Translation
 
 struct SearchResult {
     let localIdentifier: String
@@ -25,6 +26,10 @@ final class MainViewModel: ObservableObject {
 
     // ✅ 포토 라이브러리에서 가져온 자산 목록 (최신순)
     @Published var photoAssets: [PhotoAssetInfo] = []
+    
+    //번역
+    @Published var translationConfiguration: TranslationSession.Configuration?
+    var translatedText: ((String) async throws -> String)?
 
     /// 검색어와 검색 결과에 따라 그리드에 표시할 자산 목록
     var filteredAssets: [PhotoAssetInfo] {
@@ -154,16 +159,35 @@ final class MainViewModel: ObservableObject {
     }
     
     // MARK: - 검색
-
     func search() {
-        let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else {
+        let raw = query.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !raw.isEmpty else {
             Task { await loadAllAsResults() }
             return
         }
 
         Task {
-            await performSearch(query: text)
+            // 1) 번역기가 주입되어 있으면 먼저 번역 시도 (예: 한국어 → 영어)
+            let textForSearch: String
+            if let translator = translatedText {
+                do {
+                    let translated = try await translator(raw)
+                    // 빈 문자열이나 whitespace만 나오는 경우를 방지
+                    let trimmedTranslated = translated.trimmingCharacters(in: .whitespacesAndNewlines)
+                    textForSearch = trimmedTranslated.isEmpty ? raw : trimmedTranslated
+                } catch {
+                    // 번역 실패 시 상태 메세지만 남기고 원문으로 검색
+                    statusMessage = "Translation failed: \(error.localizedDescription). Searching with original text."
+                    textForSearch = raw
+                }
+            } else {
+                // 번역기가 설정되지 않은 경우에는 그대로 원문으로 검색
+                textForSearch = raw
+            }
+
+            // 2) MobileCLIP 검색 수행
+            await performSearch(query: textForSearch)
         }
     }
 
@@ -190,4 +214,14 @@ final class MainViewModel: ObservableObject {
     func score(for assetId: String) -> Float? {
         results.first(where: { $0.localIdentifier == assetId })?.score
     }
+    
+    //MARK: - Translation
+    func configureTranslation() {
+        translationConfiguration?.invalidate()
+        translationConfiguration = TranslationSession.Configuration(
+            source: Locale(identifier: "ko-KR").language,
+            target: Locale(identifier: "en-US").language,
+        )
+    }
+
 }
